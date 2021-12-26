@@ -1322,6 +1322,7 @@ void database::post_push_virtual_operation( const operation& op )
 
 void database::notify_pre_apply_operation( const operation_notification& note )
 {
+  idump((note.op));
   HIVE_TRY_NOTIFY( _pre_apply_operation_signal, note )
 }
 
@@ -5150,8 +5151,9 @@ FC_TODO( "#ifndef not needed after HF 20 is live" );
             }
           }
 #endif
+
+          post_push_virtual_operation( producer_missed_operation( w.owner ) );
         } );
-        push_virtual_operation( producer_missed_operation( witness_missed.owner ) );
       }
     }
   }
