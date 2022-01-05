@@ -569,6 +569,8 @@ public:
 
   void find_account_history_data(const account_name_type& name, uint64_t start, uint32_t limit, bool include_reversible,
     std::function<bool(unsigned int, const rocksdb_operation_object&)> processor) const;
+  uint32_t find_reversible_account_history_data(const account_name_type& name, uint64_t start, uint32_t limit, uint32_t number_of_irreversible_ops,
+    std::function<bool(unsigned int, const rocksdb_operation_object&)> processor) const;
   bool find_operation_object(size_t opId, rocksdb_operation_object* op) const;
   /// Allows to look for all operations present in given block and call `processor` for them.
   void find_operations_by_block(size_t blockNum, bool include_reversible,
@@ -808,6 +810,8 @@ private:
 
   std::vector<rocksdb_operation_object> collectReversibleOps(uint32_t* blockRangeBegin, uint32_t* blockRangeEnd,
     uint32_t* collectedIrreversibleBlock) const;
+
+  std::vector<rocksdb_operation_object> collectReversibleOpsForAccount(const account_name_type& name) const;
 
 /// Class attributes:
 private:
@@ -1162,11 +1166,39 @@ account_history_rocksdb_plugin::impl::collectReversibleOps(uint32_t* blockRangeB
   return retVal;
 }
 
+std::vector<rocksdb_operation_object>
+account_history_rocksdb_plugin::impl::collectReversibleOpsForAccount(const account_name_type& name) const
+{
+  // add thread safety
+  elog("inside collectReversibleOpsForAccount");
+
+  std::vector<rocksdb_operation_object> retVal;
+  const auto& volatileIdx = _mainDb.get_index< volatile_operation_index, by_block >();
+
+  retVal.reserve(volatileIdx.size());
+
+  auto opIterator = volatileIdx.begin();
+  for(; opIterator != volatileIdx.end(); ++opIterator)
+  {
+    rocksdb_operation_object obj(*opIterator);
+    hive::protocol::operation op = fc::raw::unpack_from_buffer< hive::protocol::operation >( obj.serialized_op );
+    auto impacted = getImpactedAccounts( op );
+    if( std::find( impacted.begin(), impacted.end(), name) != impacted.end() )
+      retVal.emplace_back(std::move(obj));
+  }
+
+  return retVal;
+}
+
 void account_history_rocksdb_plugin::impl::find_account_history_data(const account_name_type& name, uint64_t start,
   uint32_t limit, bool include_reversible, std::function<bool(unsigned int, const rocksdb_operation_object&)> processor) const
 {
+  elog("find_account_history_data include_reversible ${i}", ("i", include_reversible));
   if(limit == 0)
     return;
+
+  unsigned int count = 0;
+  unsigned int number_of_irreversible_ops = 0;
 
   ReadOptions rOptions;
 
@@ -1174,8 +1206,13 @@ void account_history_rocksdb_plugin::impl::find_account_history_data(const accou
   PinnableSlice buffer;
   auto s = _storage->Get(rOptions, _columnHandles[Columns::AH_INFO_BY_NAME], nameSlice, &buffer);
 
+  elog("find_account_history_data s.IsNotFound ${i}", ("i", s.IsNotFound()));
   if(s.IsNotFound())
+  {
+    if(include_reversible)
+      find_reversible_account_history_data(name, start, limit, number_of_irreversible_ops, processor);
     return;
+  }
 
   checkStatus(s);
 
@@ -1195,15 +1232,24 @@ void account_history_rocksdb_plugin::impl::find_account_history_data(const accou
 
   it->SeekForPrev(key);
 
+  elog("find_account_history_data it->Valid ${i}", ("i", it->Valid()));
   if(it->Valid() == false)
+  {
+    if(include_reversible)
+      find_reversible_account_history_data(name, start, limit, number_of_irreversible_ops, processor);
     return;
+  }
 
   auto keySlice = it->key();
   auto keyValue = ah_op_by_id_slice_t::unpackSlice(keySlice);
 
-  unsigned int count = 0;
+  number_of_irreversible_ops = keyValue.second;
+  elog("find_account_history_data number_of_irreversible_ops ${i}", ("i", number_of_irreversible_ops));
 
-  for(; it->Valid(); it->Prev())
+  if(include_reversible)
+    count += find_reversible_account_history_data(name, start, limit, number_of_irreversible_ops, processor);
+
+  for(; it->Valid() && count<limit; it->Prev())
   {
     auto keySlice = it->key();
     if(keySlice.starts_with(ahIdSlice) == false)
@@ -1224,6 +1270,32 @@ void account_history_rocksdb_plugin::impl::find_account_history_data(const accou
         break;
     }
   }
+}
+
+uint32_t account_history_rocksdb_plugin::impl::find_reversible_account_history_data(const account_name_type& name, uint64_t start,
+  uint32_t limit, uint32_t number_of_irreversible_ops, std::function<bool(unsigned int, const rocksdb_operation_object&)> processor) const
+{
+  uint32_t count = 0;
+  if(number_of_irreversible_ops < start)
+  {
+    auto reversibleOps = collectReversibleOpsForAccount(name);
+    elog("find_account_history_data collectReversibleOpsForAccount done");
+
+    if( number_of_irreversible_ops + reversibleOps.size() < start )
+      start = number_of_irreversible_ops + reversibleOps.size();
+
+    for(int i = start-number_of_irreversible_ops-1; i>=0; i--)
+    {
+      rocksdb_operation_object oObj = reversibleOps[i];
+      if(processor(number_of_irreversible_ops + i, oObj))
+      {
+        ++count;
+        if(count >= limit)
+          return count;
+      }
+    }
+  }
+  return count;
 }
 
 bool account_history_rocksdb_plugin::impl::find_operation_object(size_t opId, rocksdb_operation_object* op) const
