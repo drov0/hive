@@ -1531,6 +1531,22 @@ bool account_history_rocksdb_plugin::impl::find_transaction_info(const protocol:
 
   FC_ASSERT(s.IsNotFound());
 
+  // add thread safety here
+  if(include_reversible)
+  {
+    const auto& volatileIdx = _mainDb.get_index< volatile_operation_index, by_block >();
+
+    for(auto opIterator = volatileIdx.begin(); opIterator != volatileIdx.end(); ++opIterator)
+    {
+      if( opIterator->trx_id == trxId)
+      {
+        *blockNo = opIterator->block;
+        *txInBlock = opIterator->trx_in_block;
+        return true;
+      }
+    }
+  }
+
   return false;
   }
 
